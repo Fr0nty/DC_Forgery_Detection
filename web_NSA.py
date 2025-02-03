@@ -6,12 +6,13 @@ import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, confusion_matrix, classification_report, roc_curve, auc, precision_recall_curve
-from sklearn.linear_model import LogisticRegression
 from keras.models import Sequential
 from keras.layers import Conv2D, MaxPooling2D, Flatten, Dense
 from imblearn.over_sampling import SMOTE
 import seaborn as sns
 import streamlit as st
+from skimage.feature import graycomatrix, graycoprops
+from skimage.color import rgb2gray
 
 # Step 1: Create folders for normal and anomaly cells
 def create_folders():
@@ -99,25 +100,139 @@ def extract_features(cells):
 
     return features
 
-# Step 5: Train and evaluate the model
-def train_and_evaluate(x_train, x_test, y_train, y_test, x_test_images):
-    # Use SMOTE to address class imbalance
-    smote = SMOTE(random_state=42)
-    x_train_resampled, y_train_resampled = smote.fit_resample(x_train, y_train)
+# Dendritic Cell Algorithm (DCA) Implementation
+class NegativeSelectionAlgorithm:
+    def __init__(self, self_set, num_detectors=100, threshold=0.1):
+        """
+        Initialize the Negative Selection Algorithm.
+        
+        :param self_set: The self-set (normal data).
+        :param num_detectors: Number of detectors to generate.
+        :param threshold: Threshold for matching (smaller values mean stricter matching).
+        """
+        self.self_set = self_set
+        self.num_detectors = num_detectors
+        self.threshold = threshold
+        self.detectors = self._generate_detectors()
 
-    # Train a Logistic Regression model
-    model = LogisticRegression(random_state=42)
-    model.fit(x_train_resampled, y_train_resampled)
+    def _generate_detectors(self):
+        """
+        Generate detectors that do not match the self-set.
+        """
+        detectors = []
+        num_features = self.self_set.shape[1]
+
+        while len(detectors) < self.num_detectors:
+            # Randomly generate a candidate detector
+            detector = np.random.rand(num_features)
+
+            # Check if the detector does not match any self-sample
+            if not self._matches_self(detector):
+                detectors.append(detector)
+
+        return np.array(detectors)
+
+    def _matches_self(self, detector):
+        """
+        Check if a detector matches any sample in the self-set.
+        """
+        for self_sample in self.self_set:
+            distance = np.linalg.norm(detector - self_sample)
+            if distance < self.threshold:
+                return True  # Detector matches self
+        return False  # Detector does not match self
+
+    def classify(self, data):
+        """
+        Classify data points as self (0) or non-self (1).
+        """
+        predictions = []
+
+        for sample in data:
+            is_non_self = False
+
+            # Check if the sample matches any detector
+            for detector in self.detectors:
+                distance = np.linalg.norm(sample - detector)
+                if distance < self.threshold:
+                    is_non_self = True
+                    break
+
+            predictions.append(1 if is_non_self else 0)
+
+        return np.array(predictions)
+
+def extract_features(images):
+    """
+    Extract features from 64x64 image cells.
+    """
+    features = []
+
+    for image in images:
+        # Ensure the image is in the correct shape (height × width × channels)
+        if image.ndim == 2:
+            # If grayscale, use as is
+            gray_image = image
+        elif image.shape[-1] == 3:
+            # If RGB, convert to grayscale
+            gray_image = rgb2gray(image)
+        else:
+            # If multi-channel, reduce to grayscale by averaging across channels
+            gray_image = np.mean(image, axis=-1)
+
+        # Ensure the image is 2D
+        if gray_image.ndim != 2:
+            raise ValueError(f"Expected 2D grayscale image, but got {gray_image.ndim} dimensions.")
+
+        # Rescale grayscale image to [0, 255] and convert to uint8
+        gray_image = (gray_image * 255).astype(np.uint8)
+
+        # Compute texture features using GLCM
+        glcm = graycomatrix(gray_image, distances=[1], angles=[0], symmetric=True, normed=True)
+        contrast = graycoprops(glcm, 'contrast')[0, 0]
+        correlation = graycoprops(glcm, 'correlation')[0, 0]
+        energy = graycoprops(glcm, 'energy')[0, 0]
+        homogeneity = graycoprops(glcm, 'homogeneity')[0, 0]
+
+        # Compute color histogram (RGB)
+        if image.ndim == 3 and image.shape[-1] == 3:
+            # If RGB, compute histogram for all 3 channels
+            color_hist = np.histogram(image, bins=8, range=(0, 256))[0]
+        else:
+            # If grayscale, compute histogram for the single channel
+            color_hist = np.histogram(gray_image, bins=8, range=(0, 256))[0]
+
+        # Combine features
+        feature_vector = np.hstack([contrast, correlation, energy, homogeneity, color_hist])
+        features.append(feature_vector)
+
+    return np.array(features)
+
+def train_and_evaluate(x_train, x_test, y_train, y_test):
+    # Extract features from the image cells
+    x_train_features = extract_features(x_train)
+    x_test_features = extract_features(x_test)
+
+    # Normalize the features
+    scaler = StandardScaler()
+    x_train_features = scaler.fit_transform(x_train_features)
+    x_test_features = scaler.transform(x_test_features)
+
+    # Define the self-set (normal data)
+    self_set = x_train_features[y_train == 0]
+
+    # Initialize and train the Negative Selection Algorithm
+    nsa = NegativeSelectionAlgorithm(self_set, num_detectors=100, threshold=0.1)
+
+    # Classify the test set
+    predictions = nsa.classify(x_test_features)
 
     # Evaluate the model
-    predictions = model.predict(x_test)
     accuracy = accuracy_score(y_test, predictions)
     conf_matrix = confusion_matrix(y_test, predictions)
     class_report = classification_report(y_test, predictions)
 
     return accuracy, conf_matrix, class_report, predictions
-
-# Step 6: Determine if the image is a forgery or true artwork
 def determine_forgery(conf_matrix):
     # Extract values from the confusion matrix
     true_normal = conf_matrix[0, 0]  # True negatives
@@ -132,7 +247,6 @@ def determine_forgery(conf_matrix):
         return "True Artwork"
     else:
         return "Inconclusive"
-
 # Streamlit App
 def main():
     st.title("Art Forgery Detection")
@@ -188,11 +302,10 @@ def main():
                 x_test_images = x[indices_test]  # Use indices to get the corresponding original images
 
                 # Step 7: Train and evaluate the model
-                accuracy, conf_matrix, class_report, predictions = train_and_evaluate(x_train, x_test, y_train, y_test, x_test_images)
-
-                # Step 8: Determine if the image is a forgery or true artwork
+                accuracy, conf_matrix, class_report, predictions = train_and_evaluate(x_train, x_test, y_train, y_test)
+                # Display forgery status
+                st.write("### Forgery Detection Result")
                 forgery_status = determine_forgery(conf_matrix)
-
                 # Display results
                 st.success("Processing complete!")
                 st.write(f"Accuracy: {accuracy:.2f}")
@@ -201,15 +314,12 @@ def main():
                 st.write("Classification Report:")
                 st.write(class_report)
 
-                # Display forgery status
-                st.write("### Forgery Detection Result")
                 if forgery_status == "True Artwork":
                     st.success("The uploaded image is a **True Artwork**.")
                 elif forgery_status == "Forgery":
                     st.error("The uploaded image is a **Forgery**.")
                 else:
-                    st.warning("The result is **Inconclusive**.")
-
+                    st.warning("The result is **Inconclusive**, likely forgery.")
                 # Plot confusion matrix
                 st.write("Confusion Matrix:")
                 fig, ax = plt.subplots()
@@ -238,6 +348,8 @@ def main():
                 ax.set_ylabel("Precision")
                 ax.set_title("Precision-Recall Curve")
                 st.pyplot(fig)
+
+                
 
 # Run the Streamlit app
 if __name__ == "__main__":

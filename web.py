@@ -5,12 +5,15 @@ import random
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score, confusion_matrix, classification_report, roc_curve, auc, precision_recall_curve
+from sklearn.metrics import (accuracy_score, confusion_matrix, 
+                            classification_report, roc_curve, auc, 
+                            precision_recall_curve)
 from keras.models import Sequential
-from keras.layers import Conv2D, MaxPooling2D, Flatten, Dense
-from imblearn.over_sampling import SMOTE
+from keras.layers import (Conv2D, MaxPooling2D, GlobalAveragePooling2D,
+                         Flatten, Dense, Dropout)
 import seaborn as sns
 import streamlit as st
+from collections import defaultdict
 
 # Step 1: Create folders for normal and anomaly cells
 def create_folders():
@@ -19,30 +22,23 @@ def create_folders():
 
 # Step 2: Preprocess the image and create a grid of 64x64 cells
 def preprocess_image(image_path, cell_size=64, anomaly_percentage=0.1):
-    # Load the image
     image = cv2.imread(image_path)
     if image is None:
         raise ValueError("Image not found or could not be loaded.")
 
-    # Resize the image to 1280x1280
     image = cv2.resize(image, (1280, 1280))
-
-    # Create a grid of 64x64 cells
     cells = []
     for y in range(0, image.shape[0], cell_size):
         for x in range(0, image.shape[1], cell_size):
             cell = image[y:y + cell_size, x:x + cell_size]
             cells.append(cell)
 
-    # Save all cells in the normal folder
     for idx, cell in enumerate(cells):
         cv2.imwrite(os.path.join("normal", f"cell_{idx}.png"), cell)
 
-    # Randomly select 10% of the cells to invert (simulate anomalies)
     num_anomalies = int(len(cells) * anomaly_percentage)
     anomaly_indices = np.random.choice(len(cells), num_anomalies, replace=False)
 
-    # Invert the colors of the selected cells and save them in the anomaly folder
     for idx in anomaly_indices:
         inverted_cell = cv2.bitwise_not(cells[idx])
         cv2.imwrite(os.path.join("anomaly", f"anomaly_{idx}.png"), inverted_cell)
@@ -54,220 +50,226 @@ def load_data():
     normal_cells = []
     anomaly_cells = []
 
-    # Load normal cells
     for filename in os.listdir("normal"):
         cell = cv2.imread(os.path.join("normal", filename))
-        normal_cells.append(cell)
+        if cell is not None:
+            normal_cells.append(cell)
 
-    # Load anomaly cells
     for filename in os.listdir("anomaly"):
         cell = cv2.imread(os.path.join("anomaly", filename))
-        anomaly_cells.append(cell)
+        if cell is not None:
+            anomaly_cells.append(cell)
 
-    # Create labels (0 for normal, 1 for anomaly)
     x = np.array(normal_cells + anomaly_cells)
     y = np.array([0] * len(normal_cells) + [1] * len(anomaly_cells))
 
     return x, y
 
-# Step 4: Extract features using a deeper CNN
+# Enhanced Feature Extraction
 def extract_features(cells):
-    # Reshape cells to include channel dimension
     cells = np.array(cells).reshape((-1, 64, 64, 3))
 
-    # Feature Extraction using a deeper CNN
     def build_feature_extractor():
-        model = Sequential([
-            Conv2D(32, (3, 3), activation='relu', input_shape=(64, 64, 3)),
-            MaxPooling2D((2, 2)),
-            Conv2D(64, (3, 3), activation='relu'),
-            MaxPooling2D((2, 2)),
-            Conv2D(128, (3, 3), activation='relu'),
-            MaxPooling2D((2, 2)),
-            Flatten(),
-            Dense(128, activation='relu')
+        return Sequential([
+            Conv2D(64, (5,5), activation='relu', input_shape=(64, 64, 3)),
+            MaxPooling2D((3,3)),
+            Conv2D(128, (3,3), activation='relu'),
+            MaxPooling2D((2,2)),
+            Conv2D(256, (3,3), activation='relu'),
+            GlobalAveragePooling2D(),
+            Dense(128, activation='selu'),
+            Dropout(0.4)
         ])
-        return model
 
     feature_extractor = build_feature_extractor()
     features = feature_extractor.predict(cells)
-
-    # Standardize features
     scaler = StandardScaler()
-    features = scaler.fit_transform(features)
+    return scaler.fit_transform(features)
 
-    return features
+# Optimized Dendritic Cell Algorithm
+def compute_pamp(features, mean_normal, inv_cov_normal):
+    delta = features - mean_normal
+    return np.sqrt(np.einsum('...i,ij,...j', delta, inv_cov_normal, delta))
 
-# Dendritic Cell Algorithm (DCA) Implementation
-class DendriticCell:
-    def __init__(self):
-        self.safe_signal = 0
-        self.danger_signal = 0
-        self.inflammatory_signal = 0
-        self.antigen = None
-
-    def process_signals(self, safe, danger, inflammatory):
-        self.safe_signal += safe
-        self.danger_signal += danger
-        self.inflammatory_signal += inflammatory
-
-    def classify_antigen(self):
-        # Use a weighted sum of signals for classification
-        if self.danger_signal > 1.5 * self.safe_signal:  # Adjusted threshold
-            return 1  # Anomalous
-        else:
-            return 0  # Normal
-
-def generate_signals(features, mean_normal, std_normal, epsilon=1e-10):
-    # Generate signals based on feature distances
-    safe_signal = np.exp(-((features - mean_normal) ** 2) / (2 * (std_normal ** 2 + epsilon)))  # Gaussian-like safe signal
-    danger_signal = 1.95 - safe_signal  # Enhanced danger signal
-    inflammatory_signal = random.random()  # Random inflammatory signal
-
-    # Convert signals to scalars by taking the mean
-    safe_signal = np.mean(safe_signal)
-    danger_signal = np.mean(danger_signal)
-    inflammatory_signal = np.mean(inflammatory_signal)
-
-    return safe_signal, danger_signal, inflammatory_signal
-
-def dca_anomaly_detection(x_data, mean_normal, std_normal):
-    dendritic_cells = [DendriticCell() for _ in range(10)]  # Create 10 dendritic cells
-    predictions = []
-
-    for i, data_point in enumerate(x_data):
-        safe, danger, inflammatory = generate_signals(data_point, mean_normal, std_normal)
-        cell = dendritic_cells[i % len(dendritic_cells)]  # Round-robin assignment
-        cell.process_signals(safe, danger, inflammatory)
-        cell.antigen = data_point
-        predictions.append(cell.classify_antigen())
-
-    return predictions
-
-# Step 5: Train and evaluate the model
 def train_and_evaluate(x_train, x_test, y_train, y_test, x_test_images):
-    # Use SMOTE to address class imbalance
-    smote = SMOTE(random_state=42)
-    x_train_resampled, y_train_resampled = smote.fit_resample(x_train, y_train)
+    # Class balancing
+    normal_indices = np.where(y_train == 0)[0]
+    anomaly_indices = np.where(y_train == 1)[0]
+    min_samples = min(len(normal_indices), len(anomaly_indices))
+    
+    balanced_indices = np.concatenate([
+        np.random.choice(normal_indices, min_samples),
+        np.random.choice(anomaly_indices, min_samples)
+    ])
+    x_train = x_train[balanced_indices]
+    y_train = y_train[balanced_indices]
 
-    # Compute mean and std of normal features
-    normal_features = x_train_resampled[y_train_resampled == 0]
+    # Calculate normal statistics
+    normal_mask = (y_train == 0)
+    normal_features = x_train[normal_mask]
     mean_normal = np.mean(normal_features, axis=0)
-    std_normal = np.std(normal_features, axis=0)
+    cov_normal = np.cov(normal_features, rowvar=False)
+    inv_cov_normal = np.linalg.pinv(cov_normal)
 
-    # Run DCA on the test set
-    predictions = dca_anomaly_detection(x_test, mean_normal, std_normal)
+    # Compute signals
+    pamp_train = compute_pamp(x_train, mean_normal, inv_cov_normal)
+    danger_train = pamp_train * 1.5  # Amplify danger signal
+    safe_train = 1 / (1 + pamp_train**2)  # Quadratic suppression
+    
+    pamp_test = compute_pamp(x_test, mean_normal, inv_cov_normal)
+    danger_test = pamp_test * 2
+    safe_test = 1 / (1 + np.sqrt(pamp_test))
 
-    # Evaluate the model
-    accuracy = accuracy_score(y_test, predictions)
-    conf_matrix = confusion_matrix(y_test, predictions)
-    class_report = classification_report(y_test, predictions)
+    # Signal normalization
+    pamp_train = (pamp_train - np.min(pamp_train)) / (np.max(pamp_train) - np.min(pamp_train))
+    danger_train = (danger_train - np.min(danger_train)) / (np.max(danger_train) - np.min(danger_train))
+    
+    pamp_test = (pamp_test - np.median(pamp_test)) / (np.percentile(pamp_test, 75) - np.percentile(pamp_test, 25))
+    danger_test = (danger_test - np.median(danger_test)) / (np.percentile(danger_test, 75) - np.percentile(danger_test, 25))
 
-    return accuracy, conf_matrix, class_report, predictions
+    train_scores = (danger_train * 0.7) - (safe_train * 0.3)
+    normal_scores = train_scores[y_train == 0]
+    threshold = np.percentile(normal_scores, 97)  # 97th percentile of normal scores
+    # Context-aware classification
+    y_pred_test = []
+    for i in range(len(x_test)):
+        danger_context = np.mean(danger_test[i] > np.percentile(danger_train, 75))
+        safe_context = np.mean(safe_test[i] < np.percentile(safe_train, 25))
+        
+        combined_score = (0.6 * danger_test[i]) + (0.3 * pamp_test[i]) - (0.4 * safe_test[i])
+        
+        # Adaptive decision making
+        if combined_score > threshold:
+            y_pred_test.append(1)
+        elif danger_context > 0.8 and safe_context < 0.2:
+            y_pred_test.append(1)
+        else:
+            y_pred_test.append(0)
+    # Dendritic Cell parameters
+    num_dcs = 200
+    antigens_per_dc = 20
+    anomaly_threshold = 0.7
 
-# Streamlit App
+    # Train DCs
+    dc_assignments = [np.random.choice(len(x_train), antigens_per_dc, replace=False) 
+                     for _ in range(num_dcs)]
+    
+    dc_contexts = []
+    for indices in dc_assignments:
+        pamp_sum = pamp_train[indices].sum()
+        danger_sum = danger_train[indices].sum()
+        safe_sum = safe_train[indices].sum()
+        dc_contexts.append(1 if (pamp_sum + danger_sum) > safe_sum else 0)
+
+    # Classify test instances with dynamic threshold
+    normal_scores = []
+    anomaly_scores = []
+    y_pred_test = []
+    
+    for i in range(len(x_test)):
+        score = (danger_test[i] * 0.8) - (safe_test[i] * 1.2)
+        
+        if y_test[i] == 0:
+            normal_scores.append(score)
+        else:
+            anomaly_scores.append(score)
+            
+        y_pred_test.append(1 if score > anomaly_threshold else 0)
+
+    # Calculate metrics
+    accuracy = accuracy_score(y_test, y_pred_test)
+    conf_matrix = confusion_matrix(y_test, y_pred_test)
+    class_report = classification_report(y_test, y_pred_test)
+
+    return accuracy, conf_matrix, class_report, y_pred_test, x_test_images
+
+# Streamlit Interface
 def main():
-    st.title("Art Forgery Detection")
-    st.write("Upload a reference image (original artwork) and an image to check for forgeries.")
+    st.title("Immune-Inspired Art Forgery Detection")
+    st.write("Dendritic Cell Algorithm for Art Authentication")
 
-    # File uploader for reference image
-    st.sidebar.header("Reference Image")
-    reference_file = st.sidebar.file_uploader("Upload the reference image...", type=["jpg", "jpeg", "png"])
-    if reference_file is not None:
-        # Save the reference file
-        with open("reference_image.jpg", "wb") as f:
-            f.write(reference_file.getbuffer())
+    # Reference image upload
+    st.sidebar.header("Reference Masterpiece")
+    ref_file = st.sidebar.file_uploader("Upload genuine artwork...", type=["jpg", "jpeg", "png"])
+    if ref_file:
+        with open("reference.jpg", "wb") as f:
+            f.write(ref_file.getbuffer())
+        st.sidebar.image(ref_file, caption="Reference Artwork", use_column_width=True)
 
-        # Display the reference image
-        st.sidebar.image(reference_file, caption="Reference Image", use_column_width=True)
+    # Test image upload
+    st.header("Artwork Analysis")
+    test_file = st.file_uploader("Upload artwork for authentication...", type=["jpg", "jpeg", "png"])
+    if test_file:
+        with open("test.jpg", "wb") as f:
+            f.write(test_file.getbuffer())
+        st.image(test_file, caption="Submitted Artwork", use_column_width=True)
 
-    # File uploader for the image to check
-    st.header("Image to Check")
-    uploaded_file = st.file_uploader("Upload the image to check...", type=["jpg", "jpeg", "png"])
-    if uploaded_file is not None:
-        # Save the uploaded file
-        with open("uploaded_image.jpg", "wb") as f:
-            f.write(uploaded_file.getbuffer())
+        if st.button("Analyze with Immune Defense System"):
+            with st.spinner("Immune cells analyzing brushstrokes..."):
+                try:
+                    create_folders()
+                    
+                    # Process images
+                    ref_cells, _ = preprocess_image("reference.jpg")
+                    test_cells, _ = preprocess_image("test.jpg")
 
-        # Display the uploaded image
-        st.image(uploaded_file, caption="Uploaded Image", use_column_width=True)
+                    # Prepare dataset
+                    X = np.array(ref_cells + test_cells)
+                    y = np.array([0]*len(ref_cells) + [1]*len(test_cells))
+                    
+                    # Extract features
+                    features = extract_features(X)
 
-        # Run anomaly detection when the user clicks the button
-        if st.button("Detect Forgeries"):
-            with st.spinner("Processing..."):
-                # Step 1: Create folders
-                create_folders()
+                    # Split data
+                    X_train, X_test, y_train, y_test, indices_train, indices_test = train_test_split(
+                        features, y, np.arange(len(y)), test_size=0.2, random_state=42
+                    )
 
-                # Step 2: Preprocess the reference image and create synthetic data
-                reference_cells, _ = preprocess_image("reference_image.jpg")
+                    # Store original images for visualization
+                    X_test_images = X[indices_test]
 
-                # Step 3: Preprocess the uploaded image and create synthetic data
-                uploaded_cells, _ = preprocess_image("uploaded_image.jpg")
+                    # Train and evaluate
+                    accuracy, cm, report, preds, test_images = train_and_evaluate(
+                        X_train, X_test, y_train, y_test, X_test_images
+                    )
 
-                # Step 4: Combine the data
-                x = np.array(reference_cells + uploaded_cells)
-                y = np.array([0] * len(reference_cells) + [1] * len(uploaded_cells))
+                    # Display results
+                    st.success("Immune Analysis Complete!")
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("System Accuracy", f"{accuracy:.2%}")
+                    with col2:
+                        verdict = "Genuine Artwork" if accuracy > 0.75 else "Potential Forgery"
+                        st.metric("Expert Verdict", verdict)
 
-                # Step 5: Extract features
-                features = extract_features(x)
+                    # Confusion Matrix
+                    st.subheader("Immune Response Analysis")
+                    fig, ax = plt.subplots(figsize=(8,6))
+                    sns.heatmap(cm, annot=True, fmt='d', cmap='YlGnBu',
+                                xticklabels=['Normal', 'Anomaly'],
+                                yticklabels=['Normal', 'Anomaly'])
+                    ax.set_xlabel("Predicted Labels")
+                    ax.set_ylabel("Actual Labels")
+                    st.pyplot(fig)
 
-                # Step 6: Split the data into training and testing sets
-                x_train, x_test, y_train, y_test, indices_train, indices_test = train_test_split(
-                    features, y, np.arange(len(y)), test_size=0.2, random_state=42
-                )
+                    # Detailed Report
+                    st.subheader("Forensic Breakdown")
+                    st.code(report)
 
-                # Store the original image data for visualization
-                x_test_images = x[indices_test]  # Use indices to get the corresponding original images
+                    # Anomaly Visualization
+                    st.subheader("Detected Anomalies")
+                    anomaly_indices = np.where(np.array(preds) == 1)[0]
+                    if len(anomaly_indices) > 0:
+                        cols = st.columns(4)
+                        for idx, col in zip(anomaly_indices[:4], cols):
+                            cell = cv2.cvtColor(test_images[idx], cv2.COLOR_BGR2RGB)
+                            col.image(cell, caption=f"Anomaly {idx+1}", use_column_width=True)
+                    else:
+                        st.info("No significant anomalies detected")
 
-                # Step 7: Train and evaluate the model
-                accuracy, conf_matrix, class_report, predictions = train_and_evaluate(x_train, x_test, y_train, y_test, x_test_images)
+                except Exception as e:
+                    st.error(f"Immune system error: {str(e)}")
 
-                # Display results
-                st.success("Processing complete!")
-                st.write(f"Accuracy: {accuracy:.2f}")
-                st.write("Confusion Matrix:")
-                st.write(conf_matrix)
-                st.write("Classification Report:")
-                st.write(class_report)
-
-                # Plot confusion matrix
-                st.write("Confusion Matrix:")
-                fig, ax = plt.subplots()
-                sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues', ax=ax)
-                st.pyplot(fig)
-
-                # Plot ROC curve
-                st.write("ROC Curve:")
-                fpr, tpr, _ = roc_curve(y_test, predictions)
-                roc_auc = auc(fpr, tpr)
-                fig, ax = plt.subplots()
-                ax.plot(fpr, tpr, color='blue', lw=2, label=f'ROC curve (area = {roc_auc:.2f})')
-                ax.plot([0, 1], [0, 1], color='gray', linestyle='--')
-                ax.set_xlabel("False Positive Rate")
-                ax.set_ylabel("True Positive Rate")
-                ax.set_title("ROC Curve")
-                ax.legend()
-                st.pyplot(fig)
-
-                # Plot Precision-Recall curve
-                st.write("Precision-Recall Curve:")
-                precision, recall, _ = precision_recall_curve(y_test, predictions)
-                fig, ax = plt.subplots()
-                ax.plot(recall, precision, color='green', lw=2)
-                ax.set_xlabel("Recall")
-                ax.set_ylabel("Precision")
-                ax.set_title("Precision-Recall Curve")
-                st.pyplot(fig)
-
-                # Show random samples
-                st.write("Random Samples:")
-                fig, axes = plt.subplots(2, 5, figsize=(12, 6))
-                for i, ax in enumerate(axes.flat):
-                    ax.imshow(x_test_images[i])
-                    ax.set_title(f"True: {y_test[i]}\nPred: {predictions[i]}")
-                    ax.axis('off')
-                st.pyplot(fig)
-
-# Run the Streamlit app
 if __name__ == "__main__":
     main()
